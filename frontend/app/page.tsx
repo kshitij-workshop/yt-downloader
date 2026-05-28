@@ -19,10 +19,20 @@ type Quality = {
   size_bytes?: number | null;
 };
 
+type PlaylistEntry = {
+  playlist_index: number;
+  title: string;
+  duration?: number | null;
+};
+
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
 export default function Home() {
+  const downloadIdKey = "yt-downloader:download-id";
+  const urlKey = "yt-downloader:last-url";
+  const playlistKey = "yt-downloader:last-is-playlist";
+  const selectionKey = "yt-downloader:last-playlist-selection";
   const [url, setUrl] = useState("");
   const [title, setTitle] = useState("");
   const [qualities, setQualities] = useState<Quality[]>([]);
@@ -47,6 +57,70 @@ export default function Home() {
   const [itemCount, setItemCount] = useState<number | null>(null);
   const [itemTitle, setItemTitle] = useState<string | null>(null);
   const [autoPaused, setAutoPaused] = useState(false);
+  const [playlistEntries, setPlaylistEntries] = useState<PlaylistEntry[]>([]);
+  const [selectedEntries, setSelectedEntries] = useState<Set<number>>(
+    () => new Set()
+  );
+  const [restoredSelection, setRestoredSelection] = useState<number[] | null>(
+    null
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const savedDownload = window.localStorage.getItem(downloadIdKey);
+    const savedUrl = window.localStorage.getItem(urlKey);
+    const savedIsPlaylist = window.localStorage.getItem(playlistKey);
+    const savedSelection = window.localStorage.getItem(selectionKey);
+    if (savedDownload) {
+      setDownloadId(savedDownload);
+      setNotice("Restored in-progress download.");
+    }
+    if (savedUrl) {
+      setUrl(savedUrl);
+    }
+    if (savedIsPlaylist) {
+      setIsPlaylist(savedIsPlaylist === "true");
+    }
+    if (savedSelection) {
+      try {
+        const parsed = JSON.parse(savedSelection) as number[];
+        if (Array.isArray(parsed)) {
+          setRestoredSelection(parsed);
+        }
+      } catch {
+        setRestoredSelection(null);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (downloadId) {
+      window.localStorage.setItem(downloadIdKey, downloadId);
+    } else {
+      window.localStorage.removeItem(downloadIdKey);
+    }
+  }, [downloadId, downloadIdKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(urlKey, url);
+    window.localStorage.setItem(playlistKey, String(isPlaylist));
+  }, [url, isPlaylist, urlKey, playlistKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const sorted = Array.from(selectedEntries).sort((a, b) => a - b);
+    window.localStorage.setItem(selectionKey, JSON.stringify(sorted));
+  }, [selectedEntries, selectionKey]);
 
   const formatBytes = (value?: number | null) => {
     if (!value || value <= 0) {
@@ -59,6 +133,15 @@ export default function Home() {
     );
     const sized = value / Math.pow(1024, index);
     return `${sized.toFixed(sized >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+  };
+
+  const formatDuration = (value?: number | null) => {
+    if (!value || value <= 0) {
+      return "";
+    }
+    const minutes = Math.floor(value / 60);
+    const seconds = Math.floor(value % 60);
+    return `${minutes}:${seconds.toString().padStart(2, "0")}`;
   };
 
   const handleFetch = async () => {
@@ -81,6 +164,26 @@ export default function Home() {
       setTitle(data.title ?? "");
       setQualities(data.qualities ?? []);
       setThumbnail(data.thumbnail ?? null);
+      setIsPlaylist(Boolean(data.is_playlist));
+      const entries = (data.entries ?? []) as PlaylistEntry[];
+      setPlaylistEntries(entries);
+      if (entries.length > 0) {
+        if (restoredSelection && restoredSelection.length > 0) {
+          const entrySet = new Set(entries.map((entry) => entry.playlist_index));
+          const nextSelection = restoredSelection.filter((value) =>
+            entrySet.has(value)
+          );
+          setSelectedEntries(new Set(nextSelection));
+          setRestoredSelection(null);
+        } else {
+          setSelectedEntries(
+            new Set(entries.map((entry) => entry.playlist_index))
+          );
+        }
+      } else {
+        setSelectedEntries(new Set());
+        setRestoredSelection(null);
+      }
       if ((data.qualities ?? []).length === 0) {
         setNotice("No formats found for this video.");
       }
@@ -97,11 +200,23 @@ export default function Home() {
     setError("");
     setAutoPaused(false);
     try {
+      if (playlistEntries.length > 0 && selectedEntries.size === 0) {
+        setError("Select at least one playlist item to download.");
+        return;
+      }
+      const playlistItems =
+        playlistEntries.length > 0
+          ? Array.from(selectedEntries).sort((a, b) => a - b).join(",")
+          : "";
       const endpoint = "download";
       const response = await fetch(
         `${BACKEND_URL}/api/${endpoint}?url=${encodeURIComponent(
           url
-        )}&format_id=${encodeURIComponent(formatId)}`
+        )}&format_id=${encodeURIComponent(formatId)}${
+          playlistItems
+            ? `&playlist_items=${encodeURIComponent(playlistItems)}`
+            : ""
+        }`
       );
       if (!response.ok) {
         const payload = await response.json();
@@ -189,6 +304,13 @@ export default function Home() {
           )}`
         );
         if (!response.ok) {
+          if (response.status === 404) {
+            setError("Download not found on server.");
+            clearInterval(interval);
+            setDownloadId(null);
+            return;
+          }
+          setNotice("Connection issue. Retrying...");
           return;
         }
         const data = await response.json();
@@ -218,15 +340,16 @@ export default function Home() {
           setNotice("Download ready. Starting in your browser.");
           setDownloadId(null);
         }
+        if (data.status === "paused" && data.error) {
+          setNotice(data.error);
+        }
         if (data.status === "error") {
           clearInterval(interval);
           setError(data.error ?? "Download failed");
           setDownloadId(null);
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Unknown error");
-        clearInterval(interval);
-        setDownloadId(null);
+        setNotice("Connection issue. Retrying...");
       }
     }, 1000);
 
@@ -311,10 +434,16 @@ export default function Home() {
                 type="checkbox"
                 checked={isPlaylist}
                 onChange={(event) => setIsPlaylist(event.target.checked)}
+                disabled={playlistEntries.length > 0}
                 className="h-4 w-4 rounded border-slate-300 text-slate-900"
               />
               Download as playlist (ZIP)
             </label>
+            {isPlaylist && (
+              <p className="text-xs text-slate-500">
+                Playlist detected. Select items below.
+              </p>
+            )}
           </div>
 
           {(error || notice) && (
@@ -358,6 +487,96 @@ export default function Home() {
                   )}
                 </div>
               </div>
+            </div>
+          )}
+
+          {isPlaylist && (
+            <div className="rounded-2xl border border-slate-200 bg-white/90 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                    Playlist items
+                  </p>
+                  <p className="text-sm text-slate-600">
+                    {playlistEntries.length > 0
+                      ? `${selectedEntries.size} of ${playlistEntries.length} selected`
+                      : "No items loaded yet."}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={handleFetch}
+                    className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
+                  >
+                    Refresh items
+                  </button>
+                  {playlistEntries.length > 0 && (
+                    <>
+                      <button
+                        onClick={() =>
+                          setSelectedEntries(
+                            new Set(
+                              playlistEntries.map((entry) => entry.playlist_index)
+                            )
+                          )
+                        }
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
+                      >
+                        Select all
+                      </button>
+                      <button
+                        onClick={() => setSelectedEntries(new Set())}
+                        className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
+                      >
+                        Clear
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              {playlistEntries.length > 0 ? (
+                <div className="mt-4 max-h-72 overflow-y-auto rounded-xl border border-slate-200">
+                  <ul className="divide-y divide-slate-200">
+                    {playlistEntries.map((entry) => (
+                      <li
+                        key={entry.playlist_index}
+                        className="flex items-center gap-3 px-3 py-2"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedEntries.has(entry.playlist_index)}
+                          onChange={() => {
+                            setSelectedEntries((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(entry.playlist_index)) {
+                                next.delete(entry.playlist_index);
+                              } else {
+                                next.add(entry.playlist_index);
+                              }
+                              return next;
+                            });
+                          }}
+                          className="h-4 w-4 rounded border-slate-300 text-slate-900"
+                        />
+                        <div className="flex flex-1 items-center justify-between gap-3">
+                          <span className="text-sm text-slate-700">
+                            {entry.playlist_index}. {entry.title}
+                          </span>
+                          {entry.duration ? (
+                            <span className="text-xs text-slate-500">
+                              {formatDuration(entry.duration)}
+                            </span>
+                          ) : null}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <div className="mt-4 rounded-xl border border-dashed border-slate-200 px-4 py-6 text-sm text-slate-500">
+                  No playlist entries found yet. Click Refresh items to load them.
+                </div>
+              )}
             </div>
           )}
 

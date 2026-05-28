@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import re
 import shutil
 import time
@@ -64,6 +65,31 @@ def _render_progress_line(percent: str, speed: str, title: str = "") -> None:
         )
 
 
+def _legacy_tls_enabled() -> bool:
+    value = os.getenv("YTDLP_LEGACY_SERVER_CONNECT", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _build_ydl_opts(base_opts: Dict[str, Any]) -> Dict[str, Any]:
+    if _legacy_tls_enabled():
+        base_opts["legacy_server_connect"] = True
+    return base_opts
+
+
+def _is_tls_handshake_error(message: str) -> bool:
+    lowered = message.lower()
+    return "ssl" in lowered and "handshake" in lowered
+
+
+def _format_download_error(exc: Exception) -> str:
+    message = str(exc)
+    if _is_tls_handshake_error(message):
+        return (
+            f"{message} (Hint: set YTDLP_LEGACY_SERVER_CONNECT=1 and retry/resume.)"
+        )
+    return message
+
+
 def _make_progress_hook(download_id: str):
     def _progress_hook(status: Dict[str, Any]) -> None:
         if status.get("status") == "downloading":
@@ -100,10 +126,12 @@ def _make_progress_hook(download_id: str):
 
 
 def _fetch_video_info(url: str, flat: bool = False) -> Dict[str, Any]:
-    ydl_opts: Dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-    }
+    ydl_opts: Dict[str, Any] = _build_ydl_opts(
+        {
+            "quiet": True,
+            "no_warnings": True,
+        }
+    )
     if flat:
         ydl_opts["extract_flat"] = "in_playlist"
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -144,9 +172,35 @@ def _extract_mp4_qualities(info: Dict[str, Any]) -> List[Dict[str, Any]]:
     return qualities
 
 
-def _download_video(download_id: str, url: str, format_id: str, temp_path: Path) -> None:
+def _extract_playlist_entries(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entries = []
+    for entry in info.get("entries", []) or []:
+        if not entry:
+            continue
+        playlist_index = entry.get("playlist_index") or entry.get("index")
+        title = entry.get("title") or "Untitled"
+        if playlist_index is None:
+            continue
+        entries.append(
+            {
+                "playlist_index": int(playlist_index),
+                "title": title,
+                "duration": entry.get("duration"),
+            }
+        )
+    entries.sort(key=lambda item: item["playlist_index"])
+    return entries
+
+
+def _download_video(
+    download_id: str,
+    url: str,
+    format_id: str,
+    temp_path: Path,
+    playlist_items: Optional[str] = None,
+) -> None:
     selector = f"{format_id}+bestaudio/best"
-    ydl_opts = {
+    ydl_opts = _build_ydl_opts({
         "format": selector,
         "outtmpl": str(temp_path),
         "merge_output_format": "mp4",
@@ -157,7 +211,9 @@ def _download_video(download_id: str, url: str, format_id: str, temp_path: Path)
         "continuedl": True,
         "retries": 10,
         "fragment_retries": 10,
-    }
+    })
+    if playlist_items:
+        ydl_opts["playlist_items"] = playlist_items
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -171,7 +227,13 @@ def _download_video(download_id: str, url: str, format_id: str, temp_path: Path)
             _downloads[download_id]["status"] = "paused"
             _downloads[download_id]["pause_requested"] = False
     except Exception as exc:
-        _downloads[download_id].update({"status": "error", "error": str(exc)})
+        message = _format_download_error(exc)
+        if _is_tls_handshake_error(message):
+            _downloads[download_id].update(
+                {"status": "paused", "error": message, "pause_requested": False}
+            )
+        else:
+            _downloads[download_id].update({"status": "error", "error": message})
 
 
 def _sanitize_filename(name: str) -> str:
@@ -187,9 +249,16 @@ def _zip_directory(source_dir: Path, target_zip: Path) -> None:
             zip_handle.write(file_path, arcname=file_path.relative_to(source_dir))
 
 
-def _download_playlist(download_id: str, url: str, format_id: str, target_dir: Path, zip_path: Path) -> None:
+def _download_playlist(
+    download_id: str,
+    url: str,
+    format_id: str,
+    target_dir: Path,
+    zip_path: Path,
+    playlist_items: Optional[str] = None,
+) -> None:
     selector = f"bestvideo[height={format_id}]+bestaudio/best" if format_id.isdigit() else format_id
-    ydl_opts = {
+    ydl_opts = _build_ydl_opts({
         "format": selector,
         "outtmpl": str(target_dir / "%(playlist_index)s-%(title)s.%(ext)s"),
         "merge_output_format": "mp4",
@@ -200,7 +269,9 @@ def _download_playlist(download_id: str, url: str, format_id: str, target_dir: P
         "continuedl": True,
         "retries": 10,
         "fragment_retries": 10,
-    }
+    })
+    if playlist_items:
+        ydl_opts["playlist_items"] = playlist_items
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -217,7 +288,13 @@ def _download_playlist(download_id: str, url: str, format_id: str, target_dir: P
             _downloads[download_id]["status"] = "paused"
             _downloads[download_id]["pause_requested"] = False
     except Exception as exc:
-        _downloads[download_id].update({"status": "error", "error": str(exc)})
+        message = _format_download_error(exc)
+        if _is_tls_handshake_error(message):
+            _downloads[download_id].update(
+                {"status": "paused", "error": message, "pause_requested": False}
+            )
+        else:
+            _downloads[download_id].update({"status": "error", "error": message})
 
 
 def _stream_file(path: Path, download_id: Optional[str] = None, cleanup_paths: Optional[List[str]] = None) -> Iterable[bytes]:
@@ -249,10 +326,18 @@ def get_qualities(url: str) -> Dict[str, Any]:
 
     is_playlist = "entries" in info or info.get("_type") == "playlist"
     if is_playlist:
+        entries = _extract_playlist_entries(info)
+        if not entries:
+            try:
+                info_full = _fetch_video_info(url, flat=False)
+                entries = _extract_playlist_entries(info_full)
+            except Exception:
+                entries = []
         return {
             "title": info.get("title", "YouTube Content"),
             "is_playlist": True,
             "thumbnail": info.get("thumbnail"),
+            "entries": entries,
             "qualities": [
                 {"format_id": "1080", "label": "1080p Full HD (MP4)"},
                 {"format_id": "720", "label": "720p HD (MP4)"},
@@ -271,7 +356,12 @@ def get_qualities(url: str) -> Dict[str, Any]:
 
 
 @app.get("/api/download")
-def download(url: str, format_id: str, background_tasks: BackgroundTasks) -> Dict[str, str]:
+def download(
+    url: str,
+    format_id: str,
+    background_tasks: BackgroundTasks,
+    playlist_items: Optional[str] = None,
+) -> Dict[str, str]:
     if not url or not format_id:
         raise HTTPException(status_code=400, detail="Missing url or format_id")
 
@@ -280,7 +370,7 @@ def download(url: str, format_id: str, background_tasks: BackgroundTasks) -> Dic
     
     # Automatic route splitting: playlist links map directly to playlist worker paths
     if is_playlist:
-        return download_playlist(url, format_id, background_tasks)
+        return download_playlist(url, format_id, background_tasks, playlist_items)
 
     temp_path = DOWNLOAD_DIR / f"download-{uuid.uuid4().hex}.mp4"
     download_id = uuid.uuid4().hex
@@ -295,13 +385,26 @@ def download(url: str, format_id: str, background_tasks: BackgroundTasks) -> Dic
         "url": url,
         "format_id": format_id,
         "is_playlist": False,
+        "playlist_items": playlist_items,
         "pause_requested": False,
     }
-    background_tasks.add_task(_download_video, download_id, url, format_id, temp_path)
+    background_tasks.add_task(
+        _download_video,
+        download_id,
+        url,
+        format_id,
+        temp_path,
+        playlist_items,
+    )
     return {"status": "started", "download_id": download_id}
 
 
-def download_playlist(url: str, format_id: str, background_tasks: BackgroundTasks) -> Dict[str, str]:
+def download_playlist(
+    url: str,
+    format_id: str,
+    background_tasks: BackgroundTasks,
+    playlist_items: Optional[str] = None,
+) -> Dict[str, str]:
     info = _fetch_video_info(url, flat=True)
     playlist_title = info.get("title") or "playlist"
     playlist_dir = DOWNLOAD_DIR / f"playlist-{uuid.uuid4().hex}"
@@ -319,11 +422,20 @@ def download_playlist(url: str, format_id: str, background_tasks: BackgroundTask
         "url": url,
         "format_id": format_id,
         "is_playlist": True,
+        "playlist_items": playlist_items,
         "pause_requested": False,
         "playlist_dir": str(playlist_dir),
         "zip_path": str(zip_path),
     }
-    background_tasks.add_task(_download_playlist, download_id, url, format_id, playlist_dir, zip_path)
+    background_tasks.add_task(
+        _download_playlist,
+        download_id,
+        url,
+        format_id,
+        playlist_dir,
+        zip_path,
+        playlist_items,
+    )
     return {"status": "started", "download_id": download_id}
 
 
@@ -371,6 +483,7 @@ def resume(download_id: str, background_tasks: BackgroundTasks) -> Dict[str, str
 
     url = payload.get("url")
     format_id = payload.get("format_id")
+    playlist_items = payload.get("playlist_items")
     if not url or not format_id:
         raise HTTPException(status_code=400, detail="Missing download metadata")
 
@@ -390,6 +503,7 @@ def resume(download_id: str, background_tasks: BackgroundTasks) -> Dict[str, str
             format_id,
             playlist_dir,
             zip_path,
+            playlist_items,
         )
     else:
         temp_path_value = payload.get("path")
@@ -402,6 +516,7 @@ def resume(download_id: str, background_tasks: BackgroundTasks) -> Dict[str, str
             url,
             format_id,
             temp_path,
+            playlist_items,
         )
     return {"status": "resumed"}
 

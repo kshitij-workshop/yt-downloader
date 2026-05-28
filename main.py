@@ -36,6 +36,10 @@ _progress_state = {
 }
 
 
+class DownloadPaused(RuntimeError):
+    pass
+
+
 def _render_progress_line(percent: str, speed: str, title: str = "") -> None:
     now = time.monotonic()
     if (
@@ -63,6 +67,10 @@ def _render_progress_line(percent: str, speed: str, title: str = "") -> None:
 def _make_progress_hook(download_id: str):
     def _progress_hook(status: Dict[str, Any]) -> None:
         if status.get("status") == "downloading":
+            if _downloads.get(download_id, {}).get("pause_requested"):
+                if download_id in _downloads:
+                    _downloads[download_id]["status"] = "paused"
+                raise DownloadPaused("Pause requested")
             percent = status.get("_percent_str", "0%").strip()
             speed = status.get("_speed_str", "?").strip()
             info_dict = status.get("info_dict") or {}
@@ -146,6 +154,9 @@ def _download_video(download_id: str, url: str, format_id: str, temp_path: Path)
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "continuedl": True,
+        "retries": 10,
+        "fragment_retries": 10,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -155,6 +166,10 @@ def _download_video(download_id: str, url: str, format_id: str, temp_path: Path)
             "path": str(temp_path),
             "content_type": "video/mp4",
         })
+    except DownloadPaused:
+        if download_id in _downloads:
+            _downloads[download_id]["status"] = "paused"
+            _downloads[download_id]["pause_requested"] = False
     except Exception as exc:
         _downloads[download_id].update({"status": "error", "error": str(exc)})
 
@@ -182,6 +197,9 @@ def _download_playlist(download_id: str, url: str, format_id: str, target_dir: P
         "quiet": True,
         "no_warnings": True,
         "noplaylist": False,
+        "continuedl": True,
+        "retries": 10,
+        "fragment_retries": 10,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -194,6 +212,10 @@ def _download_playlist(download_id: str, url: str, format_id: str, target_dir: P
             "content_type": "application/zip",
             "cleanup_paths": [str(target_dir)],
         })
+    except DownloadPaused:
+        if download_id in _downloads:
+            _downloads[download_id]["status"] = "paused"
+            _downloads[download_id]["pause_requested"] = False
     except Exception as exc:
         _downloads[download_id].update({"status": "error", "error": str(exc)})
 
@@ -270,6 +292,10 @@ def download(url: str, format_id: str, background_tasks: BackgroundTasks) -> Dic
         "path": str(temp_path),
         "filename": info_full.get("title") or "video",
         "content_type": "video/mp4",
+        "url": url,
+        "format_id": format_id,
+        "is_playlist": False,
+        "pause_requested": False,
     }
     background_tasks.add_task(_download_video, download_id, url, format_id, temp_path)
     return {"status": "started", "download_id": download_id}
@@ -290,6 +316,12 @@ def download_playlist(url: str, format_id: str, background_tasks: BackgroundTask
         "filename": _sanitize_filename(playlist_title),
         "content_type": "application/zip",
         "cleanup_paths": [str(playlist_dir)],
+        "url": url,
+        "format_id": format_id,
+        "is_playlist": True,
+        "pause_requested": False,
+        "playlist_dir": str(playlist_dir),
+        "zip_path": str(zip_path),
     }
     background_tasks.add_task(_download_playlist, download_id, url, format_id, playlist_dir, zip_path)
     return {"status": "started", "download_id": download_id}
@@ -311,6 +343,67 @@ def progress(download_id: str) -> Dict[str, Any]:
         "item_title": payload.get("item_title"),
         "error": payload.get("error"),
     }
+
+
+@app.post("/api/pause")
+def pause(download_id: str) -> Dict[str, str]:
+    if not download_id:
+        raise HTTPException(status_code=400, detail="Missing download_id")
+    payload = _downloads.get(download_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Download not found")
+    if payload.get("status") in {"complete", "processing", "error"}:
+        raise HTTPException(status_code=400, detail="Download cannot be paused")
+    payload["pause_requested"] = True
+    payload["status"] = "paused"
+    return {"status": "paused"}
+
+
+@app.post("/api/resume")
+def resume(download_id: str, background_tasks: BackgroundTasks) -> Dict[str, str]:
+    if not download_id:
+        raise HTTPException(status_code=400, detail="Missing download_id")
+    payload = _downloads.get(download_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Download not found")
+    if payload.get("status") != "paused":
+        raise HTTPException(status_code=400, detail="Download is not paused")
+
+    url = payload.get("url")
+    format_id = payload.get("format_id")
+    if not url or not format_id:
+        raise HTTPException(status_code=400, detail="Missing download metadata")
+
+    payload["pause_requested"] = False
+    payload["status"] = "queued"
+    if payload.get("is_playlist"):
+        playlist_dir_value = payload.get("playlist_dir")
+        zip_path_value = payload.get("zip_path")
+        if not playlist_dir_value or not zip_path_value:
+            raise HTTPException(status_code=400, detail="Missing playlist paths")
+        playlist_dir = Path(playlist_dir_value)
+        zip_path = Path(zip_path_value)
+        background_tasks.add_task(
+            _download_playlist,
+            download_id,
+            url,
+            format_id,
+            playlist_dir,
+            zip_path,
+        )
+    else:
+        temp_path_value = payload.get("path")
+        if not temp_path_value:
+            raise HTTPException(status_code=400, detail="Missing file path")
+        temp_path = Path(temp_path_value)
+        background_tasks.add_task(
+            _download_video,
+            download_id,
+            url,
+            format_id,
+            temp_path,
+        )
+    return {"status": "resumed"}
 
 
 @app.get("/api/stream")

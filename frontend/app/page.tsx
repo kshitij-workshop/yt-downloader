@@ -34,12 +34,19 @@ export default function Home() {
   const [progress, setProgress] = useState("0%");
   const [speed, setSpeed] = useState("?");
   const [status, setStatus] = useState<
-    "idle" | "queued" | "downloading" | "processing" | "complete" | "error"
+    "idle"
+    | "queued"
+    | "downloading"
+    | "processing"
+    | "paused"
+    | "complete"
+    | "error"
   >("idle");
   const [isPlaylist, setIsPlaylist] = useState(false);
   const [itemIndex, setItemIndex] = useState<number | null>(null);
   const [itemCount, setItemCount] = useState<number | null>(null);
   const [itemTitle, setItemTitle] = useState<string | null>(null);
+  const [autoPaused, setAutoPaused] = useState(false);
 
   const formatBytes = (value?: number | null) => {
     if (!value || value <= 0) {
@@ -88,8 +95,9 @@ export default function Home() {
   const handleDownload = async (formatId: string) => {
     setNotice("");
     setError("");
+    setAutoPaused(false);
     try {
-      const endpoint = isPlaylist ? "playlist/download" : "download";
+      const endpoint = "download";
       const response = await fetch(
         `${BACKEND_URL}/api/${endpoint}?url=${encodeURIComponent(
           url
@@ -112,6 +120,56 @@ export default function Home() {
           ? "Playlist download started on the server."
           : "Downloading started on the server."
       );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+    }
+  };
+
+  const handlePause = async (manual = true) => {
+    if (!downloadId) {
+      return;
+    }
+    setNotice("");
+    setError("");
+    try {
+      const response = await fetch(
+        `${BACKEND_URL}/api/pause?download_id=${encodeURIComponent(downloadId)}`,
+        { method: "POST" }
+      );
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload?.detail ?? "Failed to pause download");
+      }
+      if (manual) {
+        setAutoPaused(false);
+      }
+      setStatus("paused");
+      setNotice(manual ? "Download paused." : "Connection lost. Pausing download.");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+    }
+  };
+
+  const handleResume = async () => {
+    if (!downloadId) {
+      return;
+    }
+    setNotice("");
+    setError("");
+    try {
+      const response = await fetch(
+        `${BACKEND_URL}/api/resume?download_id=${encodeURIComponent(downloadId)}`,
+        { method: "POST" }
+      );
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload?.detail ?? "Failed to resume download");
+      }
+      setAutoPaused(false);
+      setStatus("queued");
+      setNotice("Resuming download...");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
@@ -174,6 +232,34 @@ export default function Home() {
 
     return () => clearInterval(interval);
   }, [downloadId]);
+
+  useEffect(() => {
+    const handleOffline = () => {
+      if (!downloadId) {
+        return;
+      }
+      if (status === "downloading" || status === "queued") {
+        setAutoPaused(true);
+        void handlePause(false);
+      }
+    };
+
+    const handleOnline = () => {
+      if (!downloadId) {
+        return;
+      }
+      if (status === "paused" && autoPaused) {
+        void handleResume();
+      }
+    };
+
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [downloadId, status, autoPaused]);
 
   return (
     <div
@@ -294,12 +380,36 @@ export default function Home() {
                 />
               </div>
               <div className="mt-2 text-xs text-slate-500">
-                {status === "processing" ? "Merging audio/video..." : `Speed: ${speed}`}
+                {status === "processing"
+                  ? "Merging audio/video..."
+                  : status === "paused"
+                  ? "Paused. Waiting to resume."
+                  : `Speed: ${speed}`}
               </div>
               {itemIndex !== null && itemCount !== null && (
                 <div className="mt-1 text-xs text-slate-500">
                   Item {itemIndex} of {itemCount}
                   {itemTitle ? ` - ${itemTitle}` : ""}
+                </div>
+              )}
+              {downloadId && (status === "downloading" || status === "queued") && (
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => handlePause(true)}
+                    className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
+                  >
+                    Pause
+                  </button>
+                </div>
+              )}
+              {downloadId && status === "paused" && (
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={handleResume}
+                    className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-800"
+                  >
+                    Resume
+                  </button>
                 </div>
               )}
             </div>
